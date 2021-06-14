@@ -1,0 +1,222 @@
+Micronaut Testing - como testar uma API gRPC:
+
+Agora vamos criar uma API gRPC para cadastrar carros e testá-la. Para cadastrar o carro o usuário terá que informar o modelo do caro (Gol, Polo,Uno) e sua Placa (HPX-1234). O retorno ao cadastrar será o id que o banco de dados gerou para o carro cadastrado. Vamos utilizar nesse projeto o banco de dados Postgres.
+Agora para testar essa API vamos criar uma classe anotada com @MicronautTest e nela criar as funções anotadas com @Test que de fato testarão a aplicação. Essa classe terá duas properties, a CarroRepository (esse faz as operações do banco de dados) e o Client (esse simula o BloomRPC, podemos fazer requsição com ele). Para rodar os testes não vamos usar o Postgres, vamos criar um banco de dados somente para testes e esse será o H2, logo vamos precisar adicionar sua dependencia e criar o arquivo application-test.yml
+
+Obs: Não se esqueça que para o Micronaut injetar um objeto do tipo Client de gRPC temos que ter uma classe de factory!
+
+Para implementar o teste, siga o passo a passo:
+
+1) No arquivo .proto vamos descrever nosso serviço:
+
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "br.com.zup";
+option java_outer_classname = "CarrosGrpc";
+
+
+package br.com.zup;
+
+service CarrosGrpcService {
+  rpc adicionar (CarroRequest) returns (CarroResponse) {}
+}
+
+message CarroRequest {
+  string modelo = 1;
+  string placa = 2;
+}
+
+message CarroResponse {
+  int64 id = 1;
+}
+
+2) Criar a classe entidade:
+@Entity
+class Carro(
+    @field:NotBlank
+    @Column(nullable = false)
+    val modelo: String,
+
+    @field:NotBlank
+    @Column(nullable = false)
+    val placa: String
+) {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    val id: Long? = null
+
+}
+
+3) Criar a interface Repository:
+
+@Repository
+interface CarrosRepository : JpaRepository<Carro, Long> {
+
+    fun existsByPlaca(placa:String) : Boolean
+}
+
+4) Implementar o serviço declarado no arquivo .proto:
+
+@Singleton
+class CarrosEndpoint(@Inject val repository: CarrosRepository) : CarrosGrpcServiceGrpc.CarrosGrpcServiceImplBase() {
+
+    override fun adicionar(request: CarroRequest, responseObserver: StreamObserver<CarroResponse>) {
+
+        if(repository.existsByPlaca(request.placa)){
+            responseObserver.onError(Status.ALREADY_EXISTS
+                .withDescription("carro com placa existente")
+                .asRuntimeException())
+            return
+        }
+
+        val carro = Carro(request.modelo, request.placa)
+
+        try{
+            repository.save(carro)
+        }catch(e:ConstraintViolationException){
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                .withDescription("dados de entrada inválidos")
+                .asRuntimeException())
+            return
+        }
+
+        responseObserver.onNext(CarroResponse.newBuilder()
+            .setId(carro.id!!)
+            .build())
+        responseObserver.onCompleted()
+
+    }
+}
+
+5)Configuração do banco de dados Postgres (application.yml):
+micronaut:
+  application:
+    name: carrosGrpc
+datasources:
+  default:
+    url: jdbc:postgresql://localhost:5433/carros
+    driverClassName: org.postgresql.Driver
+    username: postgres
+    password: postgres
+    schema-generate: CREATE_DROP
+    dialect: POSTGRES
+jpa.default.properties.hibernate.hbm2ddl.auto: update
+
+
+6) AGORA VAMOS COMEÇAR OS TESTES.
+Vamos adicionar um banco de dados espécífico para os testes. Ir no arquivo build.gradle, dentro da seção dependencies adicionar:
+	testImplementation("com.h2database:h2")
+
+E no arquivo application-test.yml que está dentro de test/resources, adicionar:
+datasources:
+  default:
+    url: jdbc:h2:mem:testDb;MVCC=TRUE;LOCK_TIMEOUT=10000;DB_CLOSE_ON_EXIT=FALSE
+    driverClassName: org.h2.Driver
+
+Obs: Use o DIFF do site do Micronaut Lauch para pegar esses dados!
+
+7)Vamos criar nossa primeira classe de teste, como queremos testar a classe CarrosEndpoint (é nela que tem o serviço implementado) vamos selecionar o nome da classe CarrosEndpoit, e apertar "alt + enter" e selecionar a opção test, assim a classe CarrosEndpointTest será criada. Essa classe deve ser anotada com @MicronautTest, assim todo o contexto do Micronaut será levantado junto com essa classe (banco de dados, os servidores, etc). Ficando assim:
+
+@MicronautTest
+internal class CarrosEndpointTest{
+
+}
+
+8) Dentro dessa classe vamos fazer uso de um Client de gRPC, só que o Micronaut só consegue injetar um Clinet gRPC se houver uma @Factory. Logo vamos criar. Podemos criar dentro dessa class CarrosEndpointTest a classe com seu método que será uma fábrica de gRPC Client:
+
+@Factory
+class Clients{
+
+    @Singleton
+    fun blockingStub(@GrpcChannel(GrpcServerChannel.NAME) channel: ManagedChannel): CarrosGrpcServiceGrpc.CarrosGrpcServiceBlockingStub? {
+        return CarrosGrpcServiceGrpc.newBlockingStub(channel)
+        
+    }
+}
+
+9) Agora na classe CarrosEndpointTest, vamos criar as funções que de fato vão testar. Podemos nomerar as funções em forma de template, ou seja, seu nome fica entre '' e pode haver espaços, assim se torna mais auto-explicativo:
+
+@Test
+fun `deve adicionar um novo carro`(){
+    // Cenário
+    repository.deleteAll()
+
+    // Ação
+    val response = grpcClient.adicionar(CarroRequest.newBuilder()
+        .setModelo("Golf")
+        .setPlaca("ABC-9999")
+        .build())
+
+    // Validação
+    assertNotNull(response.id)
+    assertTrue(repository.existsById(response.id))
+}
+
+@Test
+fun `nao deve adicionar novo carro quando carro com placa ja existente`() {
+    // Cenário
+    repository.deleteAll()
+    val existente = repository.save(Carro("Palio", "OIP-9876"))
+
+    // Ação
+    val request = CarroRequest.newBuilder()
+        .setModelo("Ferrari")
+        .setPlaca(existente.placa)
+        .build()
+
+    val error = assertThrows(StatusRuntimeException::class.java) {
+        grpcClient.adicionar(request)
+    }
+
+    //Validação
+    assertEquals(Status.ALREADY_EXISTS.code, error.status.code)
+    assertEquals("carro com placa existente", error.status.description)
+
+}
+
+@Test
+fun `nao deve adicionar novo carro quando dados de entrada forem invalidos` (){
+    // Cenário
+    repository.deleteAll()
+
+
+    // Ação
+    val request = CarroRequest.newBuilder()
+        .setModelo("")
+        .setPlaca("")
+        .build()
+
+    val error = assertThrows(StatusRuntimeException::class.java) {
+        grpcClient.adicionar(request)
+    }
+
+    //Validação
+    assertEquals(Status.INVALID_ARGUMENT.code, error.status.code)
+    assertEquals("dados de entrada inválidos", error.status.description)
+}
+
+10) É recomendado que em teste de gRPC desligemos o controle de transação, pois o servidor de gRPC roda em uma Thread separada da Thread que cada @Test rodará. Para isso trocar a anotação @MicronautTest da classe de teste para: 
+	@MicronautTest(transactional = false)
+
+11) Veja que em todo teste limpamos o banco antes de começar, podemos isolar isso na função:
+
+@BeforeEach
+fun setup(){
+    repository.deleteAll()
+}
+
+E assim podemos remover ou comentar as linhas: 
+	
+    repository.deleteAll()
+
+que estão nas funções @Test
+
+12) É possível rodar o teste via comando no terminal, basta entar na pasta do projeto e executar: .\gradlew.bat test
+
+
+
+
+
+
